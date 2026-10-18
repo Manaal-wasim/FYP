@@ -1,10 +1,22 @@
 
 import os
+from pathlib import Path
 
-from flask import Flask
+from flask import (
+    Flask,
+    request,
+    redirect,
+    url_for,
+    flash,
+    render_template_string,
+    session,
+)
+
 from dotenv import load_dotenv
-
+from flask_wtf.csrf import CSRFProtect
+from werkzeug.security import (generate_password_hash, check_password_hash,)
 from database import get_db_connection
+from signing.key_generation import generate_key_pair
 
 load_dotenv()
 
@@ -18,6 +30,24 @@ if not secret_key or secret_key == "replace_with_a_long_random_secret":
     )
 
 app.config["SECRET_KEY"] = secret_key
+# Secret used to encrypt users' private keys
+encryption_secret = os.environ.get("KEY_ENCRYPTION_SECRET")
+
+if not encryption_secret or len(encryption_secret) < 32:
+    raise RuntimeError(
+        "Set a valid KEY_ENCRYPTION_SECRET in your .env file."
+    )
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
+
+# Protect forms against CSRF attacks
+csrf = CSRFProtect(app)
+
+BASE_DIR = Path(__file__).resolve().parent
+KEYS_DIR = BASE_DIR / "keys"
+KEYS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @app.route("/")
@@ -25,6 +55,8 @@ def home():
     return """
     <h1>Financial Document Management System</h1>
     <p>Flask application is running.</p>
+    <p><a href="/register">Create an Account</a></p>
+    <p><a href="/login">Login</a></p>
     <p><a href="/db-check">Test database connection</a></p>
     """
 
@@ -60,7 +92,263 @@ def database_check():
 
         if connection is not None and connection.is_connected():
             connection.close()
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    # Display the registration form when the page is opened.
+    if request.method == "GET":
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Create Account</title>
+            </head>
+            <body>
+                <h1>Create an Account</h1>
 
+                {% for message in get_flashed_messages() %}
+                    <p>{{ message }}</p>
+                {% endfor %}
+
+                <form method="POST">
+                    <input type="hidden"
+                           name="csrf_token"
+                           value="{{ csrf_token() }}">
+
+                    <label>Name:</label>
+                    <input type="text" name="name" required>
+                    <br><br>
+
+                    <label>Email:</label>
+                    <input type="email" name="email" required>
+                    <br><br>
+
+                    <label>Password:</label>
+                    <input type="password" name="password"
+                           minlength="12" required>
+                    <br><br>
+
+                    <button type="submit">Register</button>
+                </form>
+
+                <p><a href="/">Back to Home</a></p>
+            </body>
+            </html>
+        """)
+
+    # Read the submitted form values.
+    name = request.form.get("name", "").strip()
+    email = request.form.get("email", "").strip().lower()
+    password = request.form.get("password", "")
+
+    # Perform basic input validation.
+    if not name or len(name) > 100:
+        flash("Enter a name of up to 100 characters.")
+        return redirect(url_for("register"))
+
+    if not email or len(email) > 255 or "@" not in email:
+        flash("Enter a valid email address.")
+        return redirect(url_for("register"))
+
+    if len(password) < 12:
+        flash("Your password must contain at least 12 characters.")
+        return redirect(url_for("register"))
+
+    connection = None
+    cursor = None
+    private_key_path = None
+
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+
+        # Check whether the email is already registered.
+        cursor.execute(
+            "SELECT user_id FROM users WHERE email = %s",
+            (email,),
+        )
+
+        if cursor.fetchone():
+            flash("An account with this email already exists.")
+            return redirect(url_for("register"))
+
+        # Hash the password before storing it.
+        password_hash = generate_password_hash(password)
+
+        # Generate the user's RSA key pair.
+        public_key, encrypted_private_key = generate_key_pair(
+            encryption_secret
+        )
+
+        # Create the account using the existing default User role.
+        cursor.execute(
+            """
+            INSERT INTO users (name, email, password_hash, public_key)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (name, email, password_hash, public_key),
+        )
+
+        user_id = cursor.lastrowid
+
+        # Save the encrypted private key outside the database.
+        private_key_path = KEYS_DIR / f"user_{user_id}_private.pem"
+
+        with open(private_key_path, "xb") as key_file:
+            key_file.write(encrypted_private_key)
+
+        # Commit the account to MySQL.
+        connection.commit()
+
+        flash("Account created successfully. You can now log in.")
+        return redirect(url_for("register"))
+
+    except Exception:
+        if connection is not None:
+            connection.rollback()
+
+        # Remove the newly created key file if registration fails.
+        if private_key_path is not None and private_key_path.exists():
+            private_key_path.unlink()
+
+        app.logger.exception("Registration failed")
+        flash("Registration failed. Check the server terminal for details.")
+        return redirect(url_for("register"))
+
+    finally:
+        if cursor is not None:
+            cursor.close()
+
+        if connection is not None and connection.is_connected():
+            connection.close()
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Login</title>
+            </head>
+            <body>
+                <h1>Login to Your Account</h1>
+
+                {% for message in get_flashed_messages() %}
+                    <p>{{ message }}</p>
+                {% endfor %}
+
+                <form method="POST">
+                    <input type="hidden"
+                           name="csrf_token"
+                           value="{{ csrf_token() }}">
+
+                    <label>Email:</label>
+                    <input type="email" name="email" required>
+                    <br><br>
+
+                    <label>Password:</label>
+                    <input type="password"
+                           name="password" required>
+                    <br><br>
+
+                    <button type="submit">Login</button>
+                </form>
+
+                <p>
+                    <a href="/register">Create an account</a>
+                </p>
+            </body>
+            </html>
+        """)
+
+    email = request.form.get("email", "").strip().lower()
+    password = request.form.get("password", "")
+
+    connection = None
+    cursor = None
+
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        cursor.execute(
+            """
+            SELECT user_id, name, email, password_hash, role
+            FROM users
+            WHERE email = %s
+            """,
+            (email,),
+        )
+
+        user = cursor.fetchone()
+
+        if (
+            user is None
+            or not check_password_hash(
+                user["password_hash"], password
+            )
+        ):
+            flash("Invalid email or password.")
+            return redirect(url_for("login"))
+
+        # Start a fresh authenticated session.
+        session.clear()
+        session["user_id"] = user["user_id"]
+        session["user_name"] = user["name"]
+        session["role"] = user["role"]
+
+        flash("Login successful.")
+        return redirect(url_for("dashboard"))
+
+    except Exception:
+        app.logger.exception("Login failed")
+        flash("Unable to log in. Check the server terminal.")
+        return redirect(url_for("login"))
+
+    finally:
+        if cursor is not None:
+            cursor.close()
+
+        if connection is not None and connection.is_connected():
+            connection.close()
+
+@app.route("/dashboard")
+def dashboard():
+    # Only logged-in users can access the dashboard.
+    if "user_id" not in session:
+        flash("Please log in first.")
+        return redirect(url_for("login"))
+
+    return render_template_string("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Dashboard</title>
+        </head>
+        <body>
+            <h1>Financial Document Management System</h1>
+
+            <h2>Welcome, {{ session["user_name"] }}!</h2>
+
+            <p>You are logged in successfully.</p>
+            <p>Your role: {{ session["role"] }}</p>
+
+            <form method="POST" action="{{ url_for('logout') }}">
+                <input type="hidden"
+                       name="csrf_token"
+                       value="{{ csrf_token() }}">
+
+                <button type="submit">Logout</button>
+            </form>
+        </body>
+        </html>
+    """)
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    flash("You have been logged out.")
+    return redirect(url_for("login"))
 
 if __name__ == "__main__":
     app.run(debug=True)
