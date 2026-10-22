@@ -1,7 +1,12 @@
 
+import base64
+import hashlib
 import os
 from pathlib import Path
+import uuid
 
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, utils
 from flask import (
     Flask,
     request,
@@ -11,6 +16,7 @@ from flask import (
     render_template_string,
     session,
 )
+from werkzeug.utils import secure_filename
 
 from dotenv import load_dotenv
 from flask_wtf.csrf import CSRFProtect
@@ -40,6 +46,7 @@ if not encryption_secret or len(encryption_secret) < 32:
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    MAX_CONTENT_LENGTH=16 * 1024 * 1024,
 )
 
 # Protect forms against CSRF attacks
@@ -48,6 +55,8 @@ csrf = CSRFProtect(app)
 BASE_DIR = Path(__file__).resolve().parent
 KEYS_DIR = BASE_DIR / "keys"
 KEYS_DIR.mkdir(parents=True, exist_ok=True)
+DOCUMENTS_DIR = BASE_DIR / "documents"
+DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @app.route("/")
@@ -332,6 +341,7 @@ def dashboard():
 
             <p>You are logged in successfully.</p>
             <p>Your role: {{ session["role"] }}</p>
+            <p><a href="{{ url_for('upload_document') }}">Upload a PDF</a></p>
 
             <form method="POST" action="{{ url_for('logout') }}">
                 <input type="hidden"
@@ -343,6 +353,152 @@ def dashboard():
         </body>
         </html>
     """)
+
+
+@app.route("/upload", methods=["GET", "POST"])
+def upload_document():
+    if "user_id" not in session:
+        flash("Please log in first.")
+        return redirect(url_for("login"))
+
+    if request.method == "GET":
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Upload a PDF</title>
+            </head>
+            <body>
+                <h1>Upload a PDF</h1>
+
+                {% for message in get_flashed_messages() %}
+                    <p>{{ message }}</p>
+                {% endfor %}
+
+                <form method="POST" enctype="multipart/form-data">
+                    <input type="hidden"
+                           name="csrf_token"
+                           value="{{ csrf_token() }}">
+
+                    <label for="pdf_file">PDF document:</label>
+                    <input type="file" id="pdf_file" name="pdf_file"
+                           accept=".pdf,application/pdf" required>
+                    <br><br>
+
+                    <button type="submit">Upload and Sign</button>
+                </form>
+
+                <p><a href="{{ url_for('dashboard') }}">Back to Dashboard</a></p>
+            </body>
+            </html>
+        """)
+
+    uploaded_file = request.files.get("pdf_file")
+    if uploaded_file is None or not uploaded_file.filename:
+        flash("Select a PDF file to upload.")
+        return redirect(url_for("upload_document"))
+
+    original_filename = secure_filename(uploaded_file.filename)
+    if not original_filename or Path(original_filename).suffix.lower() != ".pdf":
+        flash("Upload a file with a .pdf extension.")
+        return redirect(url_for("upload_document"))
+
+    if uploaded_file.stream.read(5) != b"%PDF-":
+        flash("The selected file does not appear to be a valid PDF.")
+        return redirect(url_for("upload_document"))
+    uploaded_file.stream.seek(0)
+
+    user_id = session["user_id"]
+    stored_filename = f"{uuid.uuid4().hex}.pdf"
+    document_path = DOCUMENTS_DIR / stored_filename
+    connection = None
+    cursor = None
+    document_saved = False
+
+    try:
+        uploaded_file.save(document_path)
+        document_saved = True
+
+        sha256 = hashlib.sha256()
+        with document_path.open("rb") as pdf_file:
+            for chunk in iter(lambda: pdf_file.read(64 * 1024), b""):
+                sha256.update(chunk)
+        file_digest = sha256.digest()
+        file_hash = sha256.hexdigest()
+
+        private_key_path = KEYS_DIR / f"user_{user_id}_private.pem"
+        encrypted_private_key = private_key_path.read_bytes()
+        private_key = serialization.load_pem_private_key(
+            encrypted_private_key,
+            password=encryption_secret.encode("utf-8"),
+        )
+        signature = private_key.sign(
+            file_digest,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH,
+            ),
+            utils.Prehashed(hashes.SHA256()),
+        )
+
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                document_id INT NOT NULL AUTO_INCREMENT,
+                sender_id INT NOT NULL,
+                document_name VARCHAR(255) NOT NULL,
+                file_path VARCHAR(500) NOT NULL,
+                document_hash CHAR(64) NOT NULL,
+                signature TEXT NOT NULL,
+                status ENUM(
+                    'PENDING', 'VALID', 'FLAGGED', 'REJECTED', 'TAMPERED'
+                ) NOT NULL DEFAULT 'PENDING',
+                timestamp TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (document_id),
+                INDEX idx_documents_sender_id (sender_id),
+                INDEX idx_documents_hash (document_hash)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            INSERT INTO documents (
+                sender_id, document_name, file_path, document_hash, signature
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                user_id,
+                original_filename,
+                str(document_path),
+                file_hash,
+                base64.b64encode(signature).decode("ascii"),
+            ),
+        )
+        connection.commit()
+
+        flash(f"PDF uploaded and signed successfully. SHA-256: {file_hash}")
+        return redirect(url_for("upload_document"))
+
+    except Exception:
+        if connection is not None:
+            connection.rollback()
+        if document_saved and document_path.exists():
+            document_path.unlink()
+
+        app.logger.exception("PDF upload or signing failed")
+        flash("The PDF could not be uploaded and signed. Check the server log.")
+        return redirect(url_for("upload_document"))
+
+    finally:
+        if cursor is not None:
+            cursor.close()
+
+        if connection is not None and connection.is_connected():
+            connection.close()
+
 
 @app.route("/logout", methods=["POST"])
 def logout():
