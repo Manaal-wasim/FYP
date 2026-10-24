@@ -5,8 +5,10 @@ import os
 from pathlib import Path
 import uuid
 
+
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, utils
+from cryptography.exceptions import InvalidSignature
 from flask import (
     Flask,
     request,
@@ -20,6 +22,7 @@ from werkzeug.utils import secure_filename
 
 from dotenv import load_dotenv
 from flask_wtf.csrf import CSRFProtect
+from flask import send_file
 from werkzeug.security import (generate_password_hash, check_password_hash,)
 from database import get_db_connection
 from signing.key_generation import generate_key_pair
@@ -321,38 +324,239 @@ def login():
         if connection is not None and connection.is_connected():
             connection.close()
 
+
 @app.route("/dashboard")
 def dashboard():
-    # Only logged-in users can access the dashboard.
     if "user_id" not in session:
         flash("Please log in first.")
         return redirect(url_for("login"))
 
-    return render_template_string("""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Dashboard</title>
-        </head>
-        <body>
-            <h1>Financial Document Management System</h1>
+    connection = None
+    cursor = None
 
-            <h2>Welcome, {{ session["user_name"] }}!</h2>
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
 
-            <p>You are logged in successfully.</p>
-            <p>Your role: {{ session["role"] }}</p>
-            <p><a href="{{ url_for('upload_document') }}">Upload a PDF</a></p>
+        cursor.execute(
+            """
+            SELECT document_id, document_name, timestamp
+            FROM documents
+            WHERE sender_id = %s
+            ORDER BY timestamp DESC
+            """,
+            (session["user_id"],)
+        )
 
-            <form method="POST" action="{{ url_for('logout') }}">
-                <input type="hidden"
-                       name="csrf_token"
-                       value="{{ csrf_token() }}">
+        documents = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT
+                d.document_id,
+                d.document_name,
+                d.timestamp,
+                d.sender_id,
+                u.name AS sender_name,
+                ds.shared_at
+            FROM document_shares AS ds
+            JOIN documents AS d
+                ON ds.document_id = d.document_id
+            JOIN users AS u
+                ON ds.sender_id = u.user_id
+            WHERE ds.receiver_id = %s
+            ORDER BY ds.shared_at DESC
+            """,
+            (session["user_id"],)
+        )
 
-                <button type="submit">Logout</button>
-            </form>
-        </body>
-        </html>
-    """)
+        shared_documents = cursor.fetchall()
+
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Dashboard</title>
+            </head>
+            <body>
+                <h1>Financial Document Management System</h1>
+
+                <h2>Welcome, {{ session["user_name"] }}!</h2>
+
+                {% for message in get_flashed_messages() %}
+                    <p>{{ message }}</p>
+                {% endfor %}
+
+                <p>Your role: {{ session["role"] }}</p>
+
+                <p>
+                    <a href="{{ url_for('upload_document') }}">
+                        Upload a PDF
+                    </a>
+                </p>
+
+                <p>
+                    <a href="{{ url_for('verify_document') }}">
+                        Verify a Received PDF
+                    </a>
+                </p>
+
+                <h2>My Documents</h2>
+
+                {% if documents %}
+                    <table border="1" cellpadding="8">
+                        <tr>
+                            <th>Document ID</th>
+                            <th>Document Name</th>
+                            <th>Uploaded At</th>
+                            <th>Action</th>
+                        </tr>
+
+                        {% for document in documents %}
+                            <tr>
+                                <td>{{ document["document_id"] }}</td>
+                                <td>{{ document["document_name"] }}</td>
+                                <td>{{ document["timestamp"] }}</td>
+                                <td>
+                                    <a href="{{ url_for(
+                                        'download_document',
+                                        document_id=document['document_id']
+                                    ) }}">
+                                        Download PDF
+                                    </a>
+                                </td>
+                            </tr>
+                        {% endfor %}
+                    </table>
+                {% else %}
+                    <p>You have not uploaded any documents yet.</p>
+                {% endif %}
+                
+                <h2>Shared With Me</h2>
+
+                {% if shared_documents %}
+                    <table border="1" cellpadding="8">
+                        <tr>
+                            <th>Document ID</th>
+                            <th>Document Name</th>
+                            <th>Shared By</th>
+                            <th>Shared At</th>
+                            <th>Action</th>
+                        </tr>
+
+                        {% for document in shared_documents %}
+                            <tr>
+                                <td>{{ document["document_id"] }}</td>
+                                <td>{{ document["document_name"] }}</td>
+                                <td>{{ document["sender_name"] }}</td>
+                                <td>{{ document["shared_at"] }}</td>
+                                <td>
+                                    <a href="{{ url_for(
+                                        'download_document',
+                                        document_id=document['document_id']
+                                    ) }}">
+                                        Download PDF
+                                    </a>
+                                </td>
+                            </tr>
+                        {% endfor %}
+                    </table>
+                {% else %}
+                    <p>No documents have been shared with you yet.</p>
+                {% endif %}
+
+
+                <br>
+
+                <form method="POST"
+                      action="{{ url_for('logout') }}">
+                    <input type="hidden"
+                           name="csrf_token"
+                           value="{{ csrf_token() }}">
+                    <button type="submit">Logout</button>
+                </form>
+            </body>
+            </html>
+        """, documents=documents, shared_documents=shared_documents)
+
+    except Exception:
+        app.logger.exception("Dashboard loading failed")
+        return "Unable to load your dashboard. Check the server log.", 500
+
+    finally:
+        if cursor is not None:
+            cursor.close()
+
+        if connection is not None and connection.is_connected():
+            connection.close()
+
+
+@app.route("/download/<int:document_id>")
+def download_document(document_id):
+    if "user_id" not in session:
+        flash("Please log in first.")
+        return redirect(url_for("login"))
+
+    connection = None
+    cursor = None
+
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        
+        cursor.execute(
+            """
+            SELECT d.document_name, d.file_path
+            FROM documents AS d
+            WHERE d.document_id = %s
+              AND (
+                  d.sender_id = %s
+                  OR EXISTS (
+                      SELECT 1
+                      FROM document_shares AS ds
+                      WHERE ds.document_id = d.document_id
+                        AND ds.receiver_id = %s
+                        AND ds.sender_id = d.sender_id
+                  )
+              )
+            """,
+            (
+                document_id,
+                session["user_id"],
+                session["user_id"]
+            )
+        )
+
+        document = cursor.fetchone()
+
+
+        if document is None:
+            return "Document not found or access denied.", 404
+
+        document_path = Path(document["file_path"]).resolve()
+
+        if not document_path.is_relative_to(DOCUMENTS_DIR.resolve()):
+            return "Invalid document path.", 403
+
+        if not document_path.is_file():
+            return "PDF file not found on the server.", 404
+
+        return send_file(
+            document_path,
+            as_attachment=True,
+            download_name=document["document_name"]
+        )
+
+    except Exception:
+        app.logger.exception("Document download failed")
+        return "Unable to download the document.", 500
+
+    finally:
+        if cursor is not None:
+            cursor.close()
+
+        if connection is not None and connection.is_connected():
+            connection.close()
 
 
 @app.route("/upload", methods=["GET", "POST"])
@@ -477,10 +681,18 @@ def upload_document():
                 base64.b64encode(signature).decode("ascii"),
             ),
         )
+        document_id = cursor.lastrowid
         connection.commit()
 
-        flash(f"PDF uploaded and signed successfully. SHA-256: {file_hash}")
-        return redirect(url_for("upload_document"))
+        # flash(f"PDF uploaded and signed successfully. SHA-256: {file_hash}")
+        # return redirect(url_for("upload_document"))
+
+        document_id = cursor.lastrowid
+        flash(
+            f"PDF uploaded and signed successfully! "
+            f"Document ID: {document_id}. SHA-256: {file_hash}")
+        
+        return redirect(url_for("dashboard"))
 
     except Exception:
         if connection is not None:
@@ -498,6 +710,322 @@ def upload_document():
 
         if connection is not None and connection.is_connected():
             connection.close()
+
+
+@app.route("/share-document", methods=["GET", "POST"])
+def share_document():
+    if "user_id" not in session:
+        flash("Please log in first.")
+        return redirect(url_for("login"))
+
+    if request.method == "POST":
+        document_id = request.form.get("document_id", "").strip()
+        receiver_email = request.form.get("receiver_email", "").strip().lower()
+
+        if not document_id.isdigit() or int(document_id) < 1:
+            flash("Enter a valid document ID.")
+            return redirect(url_for("share_document"))
+
+        if not receiver_email:
+            flash("Enter the receiver's email.")
+            return redirect(url_for("share_document"))
+
+        connection = None
+        cursor = None
+
+        try:
+            connection = get_db_connection()
+            cursor = connection.cursor()
+
+            # Check that this document belongs to the logged-in sender.
+            cursor.execute(
+                """
+                SELECT document_id
+                FROM documents
+                WHERE document_id = %s AND sender_id = %s
+                """,
+                (int(document_id), session["user_id"]),
+            )
+
+            if cursor.fetchone() is None:
+                flash("Document not found or it does not belong to you.")
+                return redirect(url_for("share_document"))
+
+            # Find the receiver using their email.
+            cursor.execute(
+                """
+                SELECT user_id
+                FROM users
+                WHERE LOWER(email) = %s AND user_id != %s
+                """,
+                (receiver_email, session["user_id"]),
+            )
+            receiver = cursor.fetchone()
+
+            if receiver is None:
+                flash("No other user was found with that email.")
+                return redirect(url_for("share_document"))
+
+            receiver_id = receiver[0]
+
+            # Prevent duplicate sharing records.
+            cursor.execute(
+                """
+                SELECT share_id
+                FROM document_shares
+                WHERE document_id = %s AND receiver_id = %s
+                """,
+                (int(document_id), receiver_id),
+            )
+
+            if cursor.fetchone() is not None:
+                flash("This document has already been shared with that user.")
+                return redirect(url_for("share_document"))
+
+            # Save the sharing permission.
+            cursor.execute(
+                """
+                INSERT INTO document_shares
+                    (document_id, sender_id, receiver_id)
+                VALUES (%s, %s, %s)
+                """,
+                (int(document_id), session["user_id"], receiver_id),
+            )
+
+            connection.commit()
+            flash("Document shared successfully!")
+
+        except Exception:
+            if connection is not None:
+                connection.rollback()
+
+            app.logger.exception("Document sharing failed")
+            flash("Could not share the document. Check the server log.")
+
+        finally:
+            if cursor is not None:
+                cursor.close()
+
+            if connection is not None and connection.is_connected():
+                connection.close()
+
+        return redirect(url_for("share_document"))
+
+    return render_template_string("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Share Document</title>
+        </head>
+        <body>
+            <h1>Share a Document</h1>
+
+            {% for message in get_flashed_messages() %}
+                <p>{{ message }}</p>
+            {% endfor %}
+
+            <form method="POST">
+                <input type="hidden"
+                       name="csrf_token"
+                       value="{{ csrf_token() }}">
+
+                <label for="document_id">Document ID:</label>
+                <input type="number" id="document_id"
+                       name="document_id" min="1" required>
+                <br><br>
+
+                <label for="receiver_email">Receiver's email:</label>
+                <input type="email" id="receiver_email"
+                       name="receiver_email" required>
+                <br><br>
+
+                <button type="submit">Share Document</button>
+            </form>
+
+            <p><a href="{{ url_for('dashboard') }}">Back to Dashboard</a></p>
+        </body>
+        </html>
+    """)
+
+
+@app.route("/verify-document", methods=["GET", "POST"])
+def verify_document():
+    if "user_id" not in session:
+        flash("Please log in first.")
+        return redirect(url_for("login"))
+
+    result = None
+
+    if request.method == "POST":
+        document_id = request.form.get("document_id", "").strip()
+        uploaded_file = request.files.get("pdf_file")
+
+        if not document_id.isdigit() or int(document_id) < 1:
+            flash("Enter a valid document ID.")
+            return redirect(url_for("verify_document"))
+
+        if uploaded_file is None or not uploaded_file.filename:
+            flash("Select the PDF you received.")
+            return redirect(url_for("verify_document"))
+
+        if Path(uploaded_file.filename).suffix.lower() != ".pdf":
+            flash("Please select a PDF file.")
+            return redirect(url_for("verify_document"))
+
+        if uploaded_file.stream.read(5) != b"%PDF-":
+            flash("The selected file does not appear to be a valid PDF.")
+            return redirect(url_for("verify_document"))
+
+        uploaded_file.stream.seek(0)
+
+        connection = None
+        cursor = None
+
+        try:
+            connection = get_db_connection()
+            cursor = connection.cursor(dictionary=True)
+
+            # Confirm that this document was shared with the receiver.
+            cursor.execute(
+                """
+                SELECT
+                    d.document_hash,
+                    d.signature,
+                    u.public_key
+                FROM document_shares AS ds
+                JOIN documents AS d
+                    ON ds.document_id = d.document_id
+                JOIN users AS u
+                    ON d.sender_id = u.user_id
+                WHERE ds.document_id = %s
+                  AND ds.receiver_id = %s
+                  AND ds.sender_id = d.sender_id
+                """,
+                (int(document_id), session["user_id"])
+            )
+
+            document = cursor.fetchone()
+
+            if document is None:
+                result = (
+                    "Verification unavailable: this document was not "
+                    "shared with your account."
+                )
+            else:
+                # Calculate the received PDF's SHA-256 hash.
+                sha256 = hashlib.sha256()
+
+                for chunk in iter(
+                    lambda: uploaded_file.stream.read(64 * 1024), b""
+                ):
+                    sha256.update(chunk)
+
+                received_digest = sha256.digest()
+                received_hash = sha256.hexdigest()
+
+                hash_matches = (
+                    received_hash == document["document_hash"]
+                )
+
+                # Load the sender's public key and stored signature.
+                public_key_data = document["public_key"]
+
+                if isinstance(public_key_data, str):
+                    public_key_data = public_key_data.encode("utf-8")
+
+                public_key = serialization.load_pem_public_key(
+                    public_key_data
+                )
+
+                signature = base64.b64decode(
+                    document["signature"],
+                    validate=True
+                )
+
+                # Verify the signature against the received PDF.
+                try:
+                    public_key.verify(
+                        signature,
+                        received_digest,
+                        padding.PSS(
+                            mgf=padding.MGF1(hashes.SHA256()),
+                            salt_length=padding.PSS.MAX_LENGTH,
+                        ),
+                        utils.Prehashed(hashes.SHA256()),
+                    )
+                    signature_valid = True
+
+                except InvalidSignature:
+                    signature_valid = False
+
+                if hash_matches and signature_valid:
+                    result = (
+                        "VERIFIED: The PDF matches the stored original "
+                        "and its digital signature is valid."
+                    )
+                else:
+                    result = (
+                        "VERIFICATION FAILED. "
+                        f"Hash matches: {hash_matches}. "
+                        f"Digital signature valid: {signature_valid}."
+                    )
+
+        except Exception:
+            app.logger.exception("Document verification failed")
+            result = (
+                "Verification could not be completed. "
+                "Check the server log for details."
+            )
+
+        finally:
+            if cursor is not None:
+                cursor.close()
+
+            if connection is not None and connection.is_connected():
+                connection.close()
+
+    return render_template_string("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Verify Document</title>
+        </head>
+        <body>
+            <h1>Verify a Financial Document</h1>
+
+            {% for message in get_flashed_messages() %}
+                <p>{{ message }}</p>
+            {% endfor %}
+
+            <form method="POST" enctype="multipart/form-data">
+                <input type="hidden"
+                       name="csrf_token"
+                       value="{{ csrf_token() }}">
+
+                <label for="document_id">Document ID:</label>
+                <input type="number" id="document_id"
+                       name="document_id" min="1" required>
+                <br><br>
+
+                <label for="pdf_file">Received PDF:</label>
+                <input type="file" id="pdf_file" name="pdf_file"
+                       accept=".pdf,application/pdf" required>
+                <br><br>
+
+                <button type="submit">Verify PDF</button>
+            </form>
+
+            {% if result %}
+                <h2>Verification Result</h2>
+                <p>{{ result }}</p>
+            {% endif %}
+
+            <p><a href="{{ url_for('dashboard') }}">
+                Back to Dashboard
+            </a></p>
+        </body>
+        </html>
+    """, result=result)
 
 
 @app.route("/logout", methods=["POST"])
